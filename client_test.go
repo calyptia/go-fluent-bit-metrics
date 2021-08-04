@@ -5,10 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -18,15 +17,22 @@ import (
 
 var baseURL string
 
-var (
-	inputs  = [...]string{"cpu"}
-	outputs = [...]string{"stdout"}
-)
+var defaultTestConfig = `
+[SERVICE]
+     HTTP_Server On
+     HTTP_Listen 0.0.0.0
+     HTTP_Port 2020
+     storage.metrics On
+[INPUT]
+     name cpu
+[OUTPUT]
+     name stdout
+`
 
 const (
-	version = "1.7"
-	// flushInterval in seconds.
-	flushInterval = 1
+	version             = "1.8"
+	flushInterval       = 1
+	fluentBitConfigName = "fluent-bit.conf"
 )
 
 func TestMain(m *testing.M) {
@@ -40,14 +46,38 @@ func testMain(m *testing.M) int {
 		return 1
 	}
 
-	fluentBitContainer, err := setupFluentBitContainer(pool)
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("cannot get cwd: %s", err.Error())
+		return 1
+	}
+
+	// docker only support mounting volumes from cwd.
+	configTmpFile, err := ioutil.TempFile(cwd, fluentBitConfigName)
+	if err != nil {
+		fmt.Printf("cannot create temp configuration file: %s", err.Error())
+		return 1
+	}
+
+	_, err = configTmpFile.Write([]byte(defaultTestConfig))
+	if err != nil {
+		fmt.Printf("cannot write temp configuration file: %s", err.Error())
+		return 1
+	}
+
+	fluentBitContainer, err := setupFluentBitContainer(pool, configTmpFile.Name())
 	if err != nil {
 		fmt.Printf("could not setup fluent bit container: %v\n", err)
 		return 1
 	}
 
 	defer func() {
-		err := pool.Purge(fluentBitContainer)
+		err := os.Remove(configTmpFile.Name())
+		if err != nil {
+			fmt.Printf("can't remove temp config file: %s", err.Error())
+		}
+
+		err = pool.Purge(fluentBitContainer)
 		if err != nil {
 			fmt.Printf("could not cleanup fluentbit container: %v\n", err)
 		}
@@ -62,20 +92,12 @@ func testMain(m *testing.M) int {
 	return m.Run()
 }
 
-func setupFluentBitContainer(pool *dockertest.Pool) (*dockertest.Resource, error) {
-	args := []string{"/fluent-bit/bin/fluent-bit", "-H"}
-	for _, input := range inputs {
-		args = append(args, "-i", input)
-	}
-	for _, output := range outputs {
-		args = append(args, "-o", output)
-	}
-	args = append(args, "-f", strconv.Itoa(flushInterval))
-
+func setupFluentBitContainer(pool *dockertest.Pool, configPath string) (*dockertest.Resource, error) {
 	return pool.RunWithOptions(&dockertest.RunOptions{
+		Mounts:     []string{configPath + ":/" + fluentBitConfigName},
 		Repository: "fluent/fluent-bit",
 		Tag:        version,
-		Cmd:        args,
+		Cmd:        []string{"/fluent-bit/bin/fluent-bit", "-c", "/" + fluentBitConfigName},
 	})
 }
 
@@ -86,7 +108,6 @@ func getFluentBitContainerBaseURL(pool *dockertest.Pool, container *dockertest.R
 		if hostPort == "" {
 			return errors.New("empty fluentbit container host-port for port 2020")
 		}
-
 		baseURL = "http://" + hostPort
 		ok, err := ping(baseURL)
 		if err != nil {
@@ -190,53 +211,32 @@ func TestClient_Metrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if want, got := len(inputs), len(mm.Input); want != got {
-		t.Fatalf("expected inputs len to be %d; got %q", want, got)
+	if want, got := 1, len(mm.Input); got < want {
+		fmt.Println(got >= want)
+		t.Fatalf("expected inputs len to be >= %d; got %d", want, got)
 	}
 
-	if want, got := len(outputs), len(mm.Output); want != got {
-		t.Fatalf("expected outputs len to be %d; got %q", want, got)
-	}
-
-	for _, input := range inputs {
-		var found bool
-		for got := range mm.Input {
-			if strings.HasPrefix(string(got), input+".") { // metric names take the format `plugin_name.ID`.
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("expected input %q; got %+v", input, metricsInputKeys(mm))
-		}
-	}
-
-	for _, output := range outputs {
-		var found bool
-		for got := range mm.Output {
-			if strings.HasPrefix(string(got), output+".") { // metric names take the format `plugin_name.ID`.
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("expected output %q; got %+v", output, metricsOutputKeys(mm))
-		}
+	if want, got := 1, len(mm.Output); got < want {
+		t.Fatalf("expected outputs len to be >= %d; got %d", want, got)
 	}
 }
 
-func metricsInputKeys(mm Metrics) []string {
-	var out []string
-	for k := range mm.Input {
-		out = append(out, string(k))
+func TestClient_StorageMetrics(t *testing.T) {
+	client := &Client{
+		HTTPClient: http.DefaultClient,
+		BaseURL:    baseURL,
 	}
-	return out
-}
 
-func metricsOutputKeys(mm Metrics) []string {
-	var out []string
-	for k := range mm.Output {
-		out = append(out, string(k))
+	mm, err := client.StorageMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	return out
+
+	if want, got := 1, mm.StorageLayer.Chunks.TotalChunks; int(got) < want {
+		t.Fatalf("expected storage total chunks to be >= %d; got %d", want, got)
+	}
+
+	if want, got := 1, len(mm.InputChunks); got < want {
+		t.Fatalf("expected input chunks len to be >= %d; got %d", want, got)
+	}
 }
